@@ -4,7 +4,7 @@
    Program       -> StatementList
    StatementList -> Statement StatementList | epsilon
    Statement     -> Declaration | Assignment
-   Declaration   -> type id ;
+   Declaration   -> type id [ = Expression ] ;
    Assignment    -> id = Expression ;
    Expression    -> Term { (+|-) Term }      (Expression -> Term Expression')
    Term          -> Factor { (*|/) Factor }  (Term -> Factor Term')
@@ -129,7 +129,7 @@ static void statement(void) {
     int line;
     panic = 0;
 
-    if (tok == INT || tok == FLOAT) {      /* Declaration -> type id ; */
+    if (tok == INT || tok == FLOAT) {      /* Declaration -> type id [ = Expression ] ; */
         const char *type = (tok == INT) ? "int" : "float";
         next();
         if (tok == ID) {
@@ -137,10 +137,8 @@ static void statement(void) {
             line = yylineno;
             next();
             declare(name, type, line);
-            if (tok == ASSIGN)
-                fail("';' (a declaration cannot be initialised; assign separately)", yylineno);
-            else
-                match(SEMICOLON);
+            if (tok == ASSIGN) { next(); expression(); }   /* optional = Expression */
+            match(SEMICOLON);
         } else
             fail("identifier", yylineno);
     }
