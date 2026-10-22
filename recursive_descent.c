@@ -1,389 +1,547 @@
 
-/*
-   Recursive Descent Compiler with Three-Address Code Generation
-
-   Program       -> StatementList
-   StatementList -> Statement StatementList | epsilon
-   Statement     -> Declaration | Assignment
-   Declaration   -> type id [ = Expression ] ;
-   Assignment    -> id = Expression ;
-   Expression    -> Term { (+|-) Term }
-   Term          -> Factor { (*|/) Factor }
-   Factor        -> ( Expression ) | id | num
-   type          -> int | float
-   num           -> digits | digits . digits
-*/
-
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include "recursive_descent.h"
 
-#define MAX 100
-#define MAX_TAC 500
-#define MAX_OPERAND 100
+#define MAX_SYMBOLS 500
+#define MAX_TAC 1000
+#define MAX_NAME 128
+#define MAX_LINE 512
+#define MAX_ERRORS 200
 
-/* ---------- Three-Address Code storage ---------- */
+/*
+Program       → StatementList
+StatementList → Statement StatementList | ε
+Statement     → Declaration | Assignment
+Declaration   → type id [ = Expression ] ;
+Assignment    → id = Expression ;
+Expression    → Term { (+|-) Term }
+Term          → Factor { (*|/) Factor }
+Factor        → ( Expression ) | id | num
+type          → int | float
+num           → digits | digits . digits
 
-static char tac[MAX_TAC][300];
+*/
+typedef struct {
+    char name[MAX_NAME];
+    char type[16];
+} Symbol;
+
+typedef struct {
+    int line;
+    char message[MAX_LINE];
+} CompileError;
+
+static Symbol symbols[MAX_SYMBOLS];
+static int symbolCount = 0;
+
+static char tac[MAX_TAC][MAX_LINE];
 static int tacCount = 0;
 static int tempCount = 0;
 
-static void newTemp(char *dest, size_t size)
-{
-    snprintf(dest, size, "t%d", ++tempCount);
+static CompileError compileErrors[MAX_ERRORS];
+static int errors = 0;
+
+static int token;
+static int tokenLine = 1;
+
+/* ---------- Lexer helpers ---------- */
+
+static void nextToken(void) {
+    token = yylex();
+    tokenLine = yylineno;
 }
 
-static void emit(const char *fmt, ...)
-{
-    if (tacCount >= MAX_TAC)
-        return;
-
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(tac[tacCount], sizeof tac[0], fmt, ap);
-    va_end(ap);
-
-    tacCount++;
+static void copyTokenText(char *dest, size_t size) {
+    snprintf(dest, size, "%s", yytext);
 }
-
-/* ---------- Symbol table and error list ---------- */
-
-char symName[MAX][50], symType[MAX][10];
-int symCount = 0;
-
-char errMsg[MAX][300];
-int errLine[MAX], errCount = 0;
-
-static int tok;
-static int prevLine = 1;
-static int panic = 0;
-
-static const char *tokName[] = {
-    "'int'", "'float'", "identifier", "number",
-    "'+'", "'-'", "'*'", "'/'", "'='", "'('",
-    "')'", "';'", "invalid token"
-};
 
 /* ---------- Error reporting ---------- */
 
-static void report(int line, const char *fmt, ...)
-{
-    va_list ap;
-
-    if (errCount >= MAX)
-        return;
-
-    va_start(ap, fmt);
-    vsnprintf(errMsg[errCount], sizeof errMsg[0], fmt, ap);
-    va_end(ap);
-
-    errLine[errCount++] = line;
+static void reportErrorAt(int line, const char *message) {
+    if (errors < MAX_ERRORS) {
+        compileErrors[errors].line = line;
+        snprintf(compileErrors[errors].message,
+                 MAX_LINE, "%s", message);
+    }
+    errors++;
 }
 
-static void next(void)
-{
-    prevLine = yylineno;
-    tok = yylex();
-
-    if (tok == INVALID)
-        report(yylineno,
-               "Lexical Error: unexpected character '%s'.", yytext);
+static void reportError(const char *message) {
+    reportErrorAt(tokenLine, message);
 }
 
-/* ---------- Semantic checks ---------- */
+/* ---------- Symbol table ---------- */
 
-static int find(const char *name)
-{
-    for (int i = 0; i < symCount; i++)
-        if (strcmp(symName[i], name) == 0)
+static int findSymbol(const char *name) {
+    for (int i = 0; i < symbolCount; i++) {
+        if (strcmp(symbols[i].name, name) == 0)
             return i;
-
+    }
     return -1;
 }
 
-static void declare(const char *name, const char *type, int line)
-{
-    if (find(name) >= 0)
-        report(line,
-               "Semantic Error: variable '%s' is already declared.",
-               name);
-    else if (symCount >= MAX)
-        report(line, "Semantic Error: symbol table is full.");
-    else {
-        snprintf(symName[symCount], sizeof symName[0], "%s", name);
-        snprintf(symType[symCount], sizeof symType[0], "%s", type);
-        symCount++;
+static int declareSymbol(const char *name, const char *type) {
+    if (findSymbol(name) >= 0) {
+        reportError("Variable already declared.");
+        return 0;
+    }
+
+    if (symbolCount >= MAX_SYMBOLS) {
+        reportError("Symbol table is full.");
+        return 0;
+    }
+
+    snprintf(symbols[symbolCount].name,
+             sizeof(symbols[symbolCount].name), "%s", name);
+    snprintf(symbols[symbolCount].type,
+             sizeof(symbols[symbolCount].type), "%s", type);
+
+    symbolCount++;
+    return 1;
+}
+
+/* ---------- TAC helpers ---------- */
+
+static void emit(const char *text) {
+    if (tacCount < MAX_TAC) {
+        snprintf(tac[tacCount], MAX_LINE, "%s", text);
+        tacCount++;
+    } else {
+        reportError("TAC buffer is full.");
     }
 }
 
-static void checkDeclared(const char *name, int line)
-{
-    if (find(name) < 0)
-        report(line,
-               "Semantic Error: variable '%s' is not declared.", name);
+static void newTemp(char *dest, size_t size) {
+    tempCount++;
+    snprintf(dest, size, "t%d", tempCount);
 }
 
-/* ---------- Syntax errors and recovery ---------- */
+static void emitOperation(char *result, size_t size,
+                          const char *left, const char *op,
+                          const char *right) {
+    char temp[MAX_NAME];
+    char line[MAX_LINE];
 
-static void fail(const char *expected, int line)
-{
-    if (panic)
-        return;
+    newTemp(temp, sizeof(temp));
 
-    panic = 1;
+    snprintf(line, sizeof(line), "%s = %s %s %s",
+             temp, left, op, right);
+    emit(line);
 
-    if (tok == INVALID)
-        return;
-
-    if (tok == 0)
-        report(line,
-               "Syntax Error: expected %s, found end of input.",
-               expected);
-    else
-        report(line,
-               "Syntax Error: expected %s, found '%s'.",
-               expected, yytext);
+    snprintf(result, size, "%s", temp);
 }
 
-static void recover(void)
-{
-    while (tok != 0 && tok != SEMICOLON &&
-           tok != INT && tok != FLOAT && tok != ID)
-        next();
+/* ---------- Expression parser ---------- */
 
-    if (tok == SEMICOLON)
-        next();
-}
+static int parseExpression(char *result, size_t size);
 
-static int match(int expected)
-{
-    if (tok == expected) {
-        next();
+static int parseFactor(char *result, size_t size) {
+    if (token == NUM) {
+        copyTokenText(result, size);
+        nextToken();
         return 1;
     }
 
-    /* A missing semicolon belongs to the preceding line. */
-    fail(tokName[expected - INT],
-         expected == SEMICOLON ? prevLine : yylineno);
+    if (token == ID) {
+        char name[MAX_NAME];
 
+        copyTokenText(name, sizeof(name));
+        int line = tokenLine;
+        nextToken();
+
+        if (findSymbol(name) < 0) {
+            reportErrorAt(line, "Use of an undeclared variable.");
+            return 0;
+        }
+
+        snprintf(result, size, "%s", name);
+        return 1;
+    }
+
+    /* Support unary minus: -1, -a, -(a + b). */
+    if (token == MINUS) {
+        nextToken();
+
+        char operand[MAX_LINE];
+
+        if (!parseFactor(operand, sizeof(operand)))
+            return 0;
+
+        if (operand[0] >= '0' && operand[0] <= '9') {
+            snprintf(result, size, "-%s", operand);
+        } else {
+            emitOperation(result, size, "0", "-", operand);
+        }
+
+        return 1;
+    }
+
+    if (token == LPAREN) {
+        nextToken();
+
+        if (!parseExpression(result, size))
+            return 0;
+
+        if (token != RPAREN) {
+            reportError("Expected ')'.");
+            return 0;
+        }
+
+        nextToken();
+        return 1;
+    }
+
+    reportError(
+        "Expected a number, variable, unary minus, or parenthesized expression."
+    );
     return 0;
 }
 
-/* ---------- Grammar rules and TAC generation ---------- */
-
-/*
-   The functions return 1 on successful parsing and 0 on failure.
-   On success, result contains the identifier, number, or temporary
-   holding the value of the parsed expression.
-*/
-
-static int expression(char *result, size_t size);
-
-static int factor(char *result, size_t size)
-{
-    if (tok == ID) {
-        snprintf(result, size, "%s", yytext);
-        checkDeclared(result, yylineno);
-        next();
-        return !panic;
-    }
-
-    if (tok == NUM) {
-        snprintf(result, size, "%s", yytext);
-        next();
-        return !panic;
-    }
-
-    if (tok == LPAREN) {
-        next();
-
-        if (!expression(result, size))
-            return 0;
-
-        if (!match(RPAREN))
-            return 0;
-
-        return !panic;
-    }
-
-    fail("identifier, number, or '('", yylineno);
-    return 0;
-}
-
-static int term(char *result, size_t size)
-{
-    char left[MAX_OPERAND];
-    char right[MAX_OPERAND];
-    char temp[MAX_OPERAND];
-
-    if (!factor(left, sizeof left))
+static int parseTerm(char *result, size_t size) {
+    if (!parseFactor(result, size))
         return 0;
 
-    while (tok == MUL || tok == DIV) {
-        int op = tok;
-        next();
+    while (token == MUL || token == DIV) {
+        const char *op = (token == MUL) ? "*" : "/";
+        char left[MAX_LINE];
+        char right[MAX_LINE];
 
-        if (!factor(right, sizeof right))
+        snprintf(left, sizeof(left), "%s", result);
+        nextToken();
+
+        if (!parseFactor(right, sizeof(right)))
             return 0;
 
-        newTemp(temp, sizeof temp);
-
-        emit("%s = %s %s %s",
-             temp, left, op == MUL ? "*" : "/", right);
-
-        snprintf(left, sizeof left, "%s", temp);
+        emitOperation(result, size, left, op, right);
     }
 
-    snprintf(result, size, "%s", left);
-    return !panic;
+    return 1;
 }
 
-static int expression(char *result, size_t size)
-{
-    char left[MAX_OPERAND];
-    char right[MAX_OPERAND];
-    char temp[MAX_OPERAND];
-
-    if (!term(left, sizeof left))
+static int parseExpression(char *result, size_t size) {
+    if (!parseTerm(result, size))
         return 0;
 
-    while (tok == PLUS || tok == MINUS) {
-        int op = tok;
-        next();
+    while (token == PLUS || token == MINUS) {
+        const char *op = (token == PLUS) ? "+" : "-";
+        char left[MAX_LINE];
+        char right[MAX_LINE];
 
-        if (!term(right, sizeof right))
+        snprintf(left, sizeof(left), "%s", result);
+        nextToken();
+
+        if (!parseTerm(right, sizeof(right)))
             return 0;
 
-        newTemp(temp, sizeof temp);
-
-        emit("%s = %s %s %s",
-             temp, left, op == PLUS ? "+" : "-", right);
-
-        snprintf(left, sizeof left, "%s", temp);
+        emitOperation(result, size, left, op, right);
     }
 
-    snprintf(result, size, "%s", left);
-    return !panic;
+    return 1;
 }
 
-/* ---------- Statements ---------- */
+/* ---------- Error recovery ---------- */
 
+static void recoverStatement(void) {
+    while (token != 0 &&
+           token != SEMICOLON &&
+           token != RBRACE &&
+           token != INT &&
+           token != FLOAT) {
+        nextToken();
+    }
 
-static void statement(void)
-{
-    char name[50];
-    char result[MAX_OPERAND];
-    int line;
+    if (token == SEMICOLON)
+        nextToken();
+}
 
-    /* Record the state before parsing this statement. */
+/* Ignore unsupported C constructs, preserving block braces. */
+static void skipUnsupported(void) {
+    int parenDepth = 0;
+
+    while (token != 0) {
+        if (token == LPAREN) {
+            parenDepth++;
+            nextToken();
+        } else if (token == RPAREN) {
+            if (parenDepth > 0)
+                parenDepth--;
+            nextToken();
+        } else if (parenDepth == 0 &&
+                   (token == LBRACE || token == RBRACE)) {
+            return;
+        } else if (parenDepth == 0 && token == SEMICOLON) {
+            nextToken();
+            return;
+        } else {
+            nextToken();
+        }
+    }
+}
+
+/* ---------- Declaration parser ---------- */
+
+static void parseDeclaration(void) {
+    char type[16];
+    char name[MAX_NAME];
+    char result[MAX_LINE];
+
+    int statementLine = tokenLine;
     int tacStart = tacCount;
-    int errStart = errCount;
+    int tempStart = tempCount;
+    int errorStart = errors;
+    int symbolStart = symbolCount;
 
-    panic = 0;
+    snprintf(type, sizeof(type), "%s",
+             token == INT ? "int" : "float");
 
-    if (tok == INT || tok == FLOAT) {
-        /* Declaration -> type id [ = Expression ] ; */
+    nextToken();
 
-        const char *type = (tok == INT) ? "int" : "float";
-        next();
-
-        if (tok == ID) {
-            snprintf(name, sizeof name, "%s", yytext);
-            line = yylineno;
-            next();
-
-            declare(name, type, line);
-
-            if (tok == ASSIGN) {
-                next();
-
-                if (expression(result, sizeof result) && !panic)
-                    emit("%s = %s", name, result);
-            }
-
-            match(SEMICOLON);
-        }
-        else {
-            fail("identifier", yylineno);
-        }
+    if (token != ID) {
+        reportErrorAt(statementLine,
+                      "Expected a variable name after the type.");
+        recoverStatement();
+        return;
     }
-    else if (tok == ID) {
-        /* Assignment -> id = Expression ; */
 
-        snprintf(name, sizeof name, "%s", yytext);
-        checkDeclared(name, yylineno);
-        next();
+    copyTokenText(name, sizeof(name));
+    nextToken();
 
-        if (match(ASSIGN)) {
-            if (expression(result, sizeof result) && !panic)
-                emit("%s = %s", name, result);
+    int declared = declareSymbol(name, type);
 
-            match(SEMICOLON);
+    if (!declared) {
+        recoverStatement();
+        return;
+    }
+
+    if (token == ASSIGN) {
+        nextToken();
+
+        if (!parseExpression(result, sizeof(result))) {
+            tacCount = tacStart;
+            tempCount = tempStart;
+            symbolCount = symbolStart;
+            recoverStatement();
+            return;
         }
+
+        if (token != SEMICOLON) {
+            reportErrorAt(statementLine,
+                          "Expected ';' after declaration.");
+
+            tacCount = tacStart;
+            tempCount = tempStart;
+            symbolCount = symbolStart;
+            recoverStatement();
+            return;
+        }
+
+        /* Emit the final assignment after expression operations. */
+        char line[MAX_LINE];
+        snprintf(line, sizeof(line), "%s = %s", name, result);
+        emit(line);
+    } else if (token != SEMICOLON) {
+        reportErrorAt(statementLine,
+                      "Expected '=' or ';' after variable name.");
+
+        tacCount = tacStart;
+        tempCount = tempStart;
+        symbolCount = symbolStart;
+        recoverStatement();
+        return;
     }
-    else {
-        fail("declaration or assignment", yylineno);
+
+    if (token == SEMICOLON)
+        nextToken();
+
+    if (errors > errorStart) {
+        tacCount = tacStart;
+        tempCount = tempStart;
+        symbolCount = symbolStart;
     }
+}
+
+/* ---------- Assignment parser ---------- */
+
+static void parseAssignment(const char *name, int statementLine) {
+    char result[MAX_LINE];
+
+    int tacStart = tacCount;
+    int tempStart = tempCount;
+    int errorStart = errors;
 
     /*
-       Discard TAC only if this statement introduced an error.
-       Errors from earlier statements must not discard valid TAC
-       generated by the current statement.
-    */
-    if (panic || errCount > errStart)
-        tacCount = tacStart;
+     * Validate the left-hand variable BEFORE parsing the expression.
+     * Assignments must never implicitly declare variables.
+     */
+    if (findSymbol(name) < 0) {
+        reportErrorAt(statementLine,
+                      "Assignment to an undeclared variable.");
+        recoverStatement();
+        return;
+    }
 
-    if (panic)
-        recover();
+    nextToken(); /* Consume '='. */
+
+    if (!parseExpression(result, sizeof(result))) {
+        tacCount = tacStart;
+        tempCount = tempStart;
+        recoverStatement();
+        return;
+    }
+
+    if (token != SEMICOLON) {
+        reportErrorAt(statementLine,
+                      "Expected ';' after assignment.");
+
+        tacCount = tacStart;
+        tempCount = tempStart;
+        recoverStatement();
+        return;
+    }
+
+    if (errors == errorStart) {
+        char line[MAX_LINE];
+        snprintf(line, sizeof(line), "%s = %s", name, result);
+        emit(line);
+    } else {
+        tacCount = tacStart;
+        tempCount = tempStart;
+    }
+
+    nextToken();
 }
 
+/* ---------- Compound assignment parser ---------- */
 
-/* ---------- Main ---------- */
+static void parseCompoundAssignment(const char *name,
+                                    const char *op,
+                                    int statementLine) {
+    char result[MAX_LINE];
 
-int main(void)
-{
-    printf("Enter the program (press Ctrl+D when finished):\n\n");
+    int tacStart = tacCount;
+    int tempStart = tempCount;
+    int errorStart = errors;
 
-    next();
+    if (findSymbol(name) < 0) {
+        reportErrorAt(statementLine,
+                      "Assignment to an undeclared variable.");
+        recoverStatement();
+        return;
+    }
 
-    while (tok != 0)
-        statement();
+    nextToken(); /* Consume += or -=. */
+
+    if (!parseExpression(result, sizeof(result))) {
+        tacCount = tacStart;
+        tempCount = tempStart;
+        recoverStatement();
+        return;
+    }
+
+    if (token != SEMICOLON) {
+        reportErrorAt(statementLine,
+                      "Expected ';' after compound assignment.");
+
+        tacCount = tacStart;
+        tempCount = tempStart;
+        recoverStatement();
+        return;
+    }
+
+    if (errors == errorStart) {
+        char temp[MAX_NAME];
+        char line[MAX_LINE];
+
+        emitOperation(temp, sizeof(temp), name, op, result);
+        snprintf(line, sizeof(line), "%s = %s", name, temp);
+        emit(line);
+    } else {
+        tacCount = tacStart;
+        tempCount = tempStart;
+    }
+
+    nextToken();
+}
+
+/* ---------- Main scanner ---------- */
+
+int main(void) {
+    nextToken();
+
+    while (token != 0) {
+        if (token == INT || token == FLOAT) {
+            parseDeclaration();
+        } else if (token == ID) {
+            char name[MAX_NAME];
+            int statementLine = tokenLine;
+
+            copyTokenText(name, sizeof(name));
+            nextToken();
+
+            if (token == ASSIGN) {
+                parseAssignment(name, statementLine);
+            } else if (token == PLUS_ASSIGN) {
+                parseCompoundAssignment(name, "+", statementLine);
+            } else if (token == MINUS_ASSIGN) {
+                parseCompoundAssignment(name, "-", statementLine);
+            } else {
+                skipUnsupported();
+            }
+        } else {
+            nextToken();
+        }
+    }
+
+    /* ---------- Compilation report ---------- */
 
     printf("\n========== COMPILATION REPORT ==========\n");
 
-    if (errCount == 0)
-        printf("Compilation successful!\n");
-    else {
-        printf("Compilation failed with %d error(s):\n", errCount);
+    if (errors == 0) {
+        printf("Compilation successful with 0 error(s).\n");
+    } else {
+        printf("Compilation failed with %d error(s):\n", errors);
 
-        for (int i = 0; i < errCount; i++)
-            printf("Line %d: %s\n", errLine[i], errMsg[i]);
+        int displayed = errors < MAX_ERRORS ? errors : MAX_ERRORS;
+
+        for (int i = 0; i < displayed; i++) {
+            printf("Line %d: Syntax Error: %s\n",
+                   compileErrors[i].line,
+                   compileErrors[i].message);
+        }
+
+        if (errors > MAX_ERRORS) {
+            printf("Additional errors omitted: %d\n",
+                   errors - MAX_ERRORS);
+        }
     }
 
-    printf("\n============ SYMBOL TABLE ==============\n");
+    /* ---------- Symbol table ---------- */
+
+    printf("\n========== SYMBOL TABLE ==========\n");
     printf("%-20s %s\n", "Identifier", "Type");
 
-    for (int i = 0; i < symCount; i++)
-        printf("%-20s %s\n", symName[i], symType[i]);
-
-    if (symCount == 0)
-        printf("No symbols declared.\n");
-
-    printf("========================================\n");
-
-    /* ---------- TAC output ---------- */
-
-    printf("\n======= THREE-ADDRESS CODE (TAC) =======\n");
-
-    if (tacCount == 0)
-        printf("No TAC generated.\n");
-    else {
-        for (int i = 0; i < tacCount; i++)
-            printf("%d: %s\n", i + 1, tac[i]);
+    for (int i = 0; i < symbolCount; i++) {
+        printf("%-20s %s\n",
+               symbols[i].name, symbols[i].type);
     }
 
-    printf("========================================\n");
+    printf("==================================\n");
 
-    return errCount == 0 ? 0 : 1;
+    /* ---------- Three-address code ---------- */
+
+    printf("\n========== THREE-ADDRESS CODE (TAC) ==========\n");
+
+    if (tacCount == 0) {
+        printf("No three-address code generated.\n");
+    } else {
+        for (int i = 0; i < tacCount; i++) {
+            printf("%d: %s\n", i + 1, tac[i]);
+        }
+    }
+
+    printf("==============================================\n");
+
+    return errors > 0 ? 1 : 0;
 }

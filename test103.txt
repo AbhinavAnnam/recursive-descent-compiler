@@ -1,0 +1,6 @@
+#include<stdio.H>
+void main()
+{
+int b=-1;
+return 0;
+}
